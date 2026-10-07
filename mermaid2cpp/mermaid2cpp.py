@@ -1258,12 +1258,13 @@ class SeqEmitter:
                     found += [r for r in self.receivers(br.items) if r not in found]
         return found
 
-    def resolve(self, ids: list[str]) -> None:
+    def candidates(self) -> list[tuple[str, str, bool]]:
+        """(name, C++ type, is-parameter) of everything a lifeline can resolve to:
+        the method's parameters, then the class's non-static fields, composition parts
+        and (testable mode) injected members."""
         injected = dict(self.g.injected_members(self.c))      # name -> collaborator type
-        extra = {n for n, _ in self.g.extra_members(self.c)}
         cands = [(p.name, cpp_type(p.type), True) for p in self.m.params]
         if not self.m.static:   # static methods cannot access instance members
-            declared = {f.name for f in self.c.fields} | {p.name for p in self.c.parts}
             for f in self.c.fields:
                 if not f.static:
                     t = f"std::shared_ptr<{injected[f.name]}>" if f.name in injected else cpp_type(f.type)
@@ -1272,9 +1273,18 @@ class SeqEmitter:
                 t = (f"std::shared_ptr<{injected[p.name]}>" if p.name in injected
                      else f"std::vector<{p.type}>" if p.many else p.type)
                 cands.append((p.name, t, False))
+            declared = {f.name for f in self.c.fields} | {p.name for p in self.c.parts}
             for n, t in injected.items():       # members added for lifelines nothing provided
                 if n not in declared:
                     cands.append((n, f"std::shared_ptr<{t}>", False))
+        return cands
+
+    def resolve_targets(self, ids: list[str]) -> dict[str, tuple[str, str, str]]:
+        """Pure resolution used by both resolve() and the test generator: map every
+        collaborator lifeline id to (variable name, C++ type, kind) where kind is
+        'param', 'member' or 'local' (a default-constructed fallback)."""
+        cands = self.candidates()
+        out: dict[str, tuple[str, str, str]] = {}
         for lid in ids:
             ll = self.seq.lifelines[lid]
             hit = [c for c in cands if c[0] == ll.instance]
@@ -1286,21 +1296,41 @@ class SeqEmitter:
                         f"parameters ({', '.join(h[0] for h in hit)}); name the lifeline "
                         "after the one you mean")
             if hit:
-                name, t, _ = hit[0]
+                name, t, is_param = hit[0]
+                out[lid] = (name, t, "param" if is_param else "member")
+            else:
+                out[lid] = (ll.instance, cpp_type(ll.type), "local")
+        return out
+
+    def resolve(self, ids: list[str]) -> None:
+        self.resolve_into(ids, self.access, locals_out=self.locals)
+
+    def resolve_into(self, ids: list[str], access: dict[str, tuple[str, str]],
+                     locals_out: dict[str, str] | None = None) -> None:
+        """Fill `access` (lifeline id -> (variable, '.'/'->')) exactly like the real
+        emission does; used by run() and by the test generator so both agree on which
+        collaborator becomes a mock member and which falls back to a local."""
+        resolved = self.resolve_targets(ids)
+        extra = {n for n, _ in self.g.extra_members(self.c)}
+        for lid in ids:
+            ll = self.seq.lifelines[lid]
+            name, t, kind = resolved[lid]
+            if kind == "local":
+                if locals_out is not None:
+                    locals_out[ll.instance] = t
+                access[lid] = (ll.instance, ".")
+                self.g.warn(f"{self.sid}: {self.c.name} has no member or parameter for lifeline "
+                            f"'{lid}' ({t}); using a default-constructed local '{ll.instance}'"
+                            " - set it up in a user slot")
+            else:
                 # GAP 2d: pointers and smart pointers (members AND parameters) use ->
-                self.access[lid] = (name, "->" if is_pointer_like(t) else ".")
+                access[lid] = (name, "->" if is_pointer_like(t) else ".")
                 if name in extra:
                     self.g.warn_once(f"{self.c.name}: no member or parameter for lifeline '{lid}' "
                                      f"({cpp_type(ll.type)}); added a new member "
                                      f"'std::shared_ptr<{cpp_type(ll.type)}> {name}' "
                                      "(inject it through the constructor)")
-            else:
-                t = cpp_type(ll.type)
-                self.locals[ll.instance] = t
-                self.access[lid] = (ll.instance, ".")
-                self.g.warn(f"{self.sid}: {self.c.name} has no member or parameter for lifeline "
-                            f"'{lid}' ({t}); using a default-constructed local '{ll.instance}'"
-                            " - set it up in a user slot")
+            self.g.cpp_refs.setdefault(self.c.name, set())
             self.g.cpp_refs[self.c.name] |= self.g.idents(ll.type)
 
     # -- emission
@@ -1433,17 +1463,17 @@ class SeqEmitter:
             if b.kind == "loop":
                 if m := re.fullmatch(r"(\d+)\s+times?", g, re.I):
                     head = f"for (int loop{k}_i = 0; loop{k}_i < {m[1]}; ++loop{k}_i) {{"
-                    self.controls.append(ControlPoint(bid, 0, "count", None, None, None, None, True))
+                    self.controls.append(ControlPoint(bid, 0, "count", g, None, None, None, True))
                 elif m := re.fullmatch(rf"for\s+each\s+({NAME_RE})\s+in\s+(\S+)", g, re.I):
                     # "loop for each i in K" -> for (int i = 0; i < K; ++i) so the
                     # loop variable is in scope for the generated calls in the body.
                     head = f"for (int {m[1]} = 0; {m[1]} < {m[2]}; ++{m[1]}) {{"
-                    self.controls.append(ControlPoint(bid, 0, "count", None, None, None, None, True))
+                    self.controls.append(ControlPoint(bid, 0, "count", g, None, None, None, True))
                 elif m := re.fullmatch(rf"for\s+each\s+({NAME_RE})\s+(\S+)", g, re.I):
                     # "loop for each i labels" -> for (auto i : labels) so the loop
                     # variable is in scope for the generated calls in the body.
                     head = f"for (auto {m[1]} : {m[2]}) {{"
-                    self.controls.append(ControlPoint(bid, 0, "count", None, None, None, None, True))
+                    self.controls.append(ControlPoint(bid, 0, "count", g, None, None, None, True))
                 elif m := re.fullmatch(rf"for\s+each\s+({NAME_RE})\s+in\s+({NAME_RE})\s+\(.+\)", g, re.I):
                     # "loop for each t in T (t from 1 to T-1)" -> a while loop whose
                     # variable is declared in the loop-body entry slot (the user
@@ -1488,7 +1518,7 @@ class SeqEmitter:
                         if g:
                             self.controls.append(ControlPoint(bid, 0, "free", None, None, None, None, False))
                         else:
-                            self.controls.append(ControlPoint(bid, 0, "count", None, None, None, None, True))
+                            self.controls.append(ControlPoint(bid, 0, "count", g, None, None, None, True))
                 self.out.append(f"{pad}{head}{note}")
             elif i > 0 and not g:
                 self.out.append(f"{pad}}} else {{")
@@ -1553,10 +1583,20 @@ class PathChoice:
     iteration: int = 0   # loops only: 0 = skipped, 1 = once, 2 = N times (>= 2 iterations)
 
 
-def _cps_for(controls: list[ControlPoint], sel: PathChoice) -> list[ControlPoint]:
-    """The control points recorded while emitting that belong to one path selection."""
+def _cps_for(controls: list[ControlPoint], sel: PathChoice,
+             blocks: dict[str, Block] | None = None) -> list[ControlPoint]:
+    """The control points recorded while emitting that belong to one path selection.
+
+    Recorded block ids carry no line number ("alt1"), while path selections carry the
+    diagram line ("alt23"); match them by kind prefix + branch (+ variable for binding
+    guards). Loop selections additionally accept the loop's own guard control point
+    recorded under the nested block id ("<loopid>_...").
+    """
     cps = controls or []
-    same = [c for c in cps if c.block_id == sel.block_id and c.branch == sel.branch]
+    skind = re.sub(r"\d+$", "", sel.block_id)    # "alt23" -> "alt", "loop5_10" -> "loop5_"
+    same = [c for c in cps if c.branch == sel.branch
+            and (c.block_id == sel.block_id
+                 or re.sub(r"\d+$", "", c.block_id) == skind)]
     if sel.kind != "loop":
         return same
     out: list[ControlPoint] = []
@@ -1566,13 +1606,19 @@ def _cps_for(controls: list[ControlPoint], sel: PathChoice) -> list[ControlPoint
     return out
 
 
+def _outer_iter(inner: list[PathChoice]) -> int:
+    """The iteration count the OUTER loop of these nested selections must run with.
+    An inner loop needs at least one outer iteration to reach its own 1/N paths."""
+    return max([c.iteration for c in inner if c.block_id.startswith("loop")] or [0])
+
+
 def enumerate_block(b: Block, bid: str) -> list[list[PathChoice]]:
     """Every distinct way through ONE block, each as the list of selections it makes.
 
     alt: one path per branch; opt: taken + skipped; loop: 0 iterations, exactly 1
     iteration and an 'N times' path (>= 2 iterations, i.e. the exit-condition path).
     Nested blocks multiply: the choices of the inner blocks are appended to every
-    outer choice that contains them.
+    outer choice that contains them (an inner 1/N path forces >= 1 outer iteration).
     """
     if b.kind == "alt":
         return [[PathChoice(bid, "alt", i)] for i in range(len(b.branches))]
@@ -1589,8 +1635,10 @@ def enumerate_block(b: Block, bid: str) -> list[list[PathChoice]]:
                 inner = [p + q for p in inner for q in subs]
             else:
                 inner = [p + [PathChoice(bid, "loop", 0, it)] for p in inner]
-        outs += [[PathChoice(bid, "loop", 0, 0)] + p for p in inner]   # 0 iterations
-        outs += [[PathChoice(bid, "loop", 0, it)] + p for p in inner]  # >= 1 iteration
+        for p in inner:                     # nested selections may require > 1 outer iteration
+            eff = max(it, _outer_iter(p))
+            outs.append([PathChoice(bid, "loop", 0, 0)] + p)      # 0 iterations
+            outs.append([PathChoice(bid, "loop", 0, eff)] + p)    # >= 1 iteration
     return outs
 
 
@@ -1692,7 +1740,7 @@ def emit_mock(c: ClassInfo, g: "Gen") -> list[str]:
     """Mock<Class> : public <Class> with a MOCK_METHOD for every non-static,
     non-constructor method (the class must have virtual methods - --testable mode)."""
     lines = [f"#pragma once", "",
-             '#include "<gmock/gmock.h>"',
+             "#include <gmock/gmock.h>",
              f'#include "{c.name}.hpp"', ""]
     if c.stereotype == "interface":
         lines.append(f"// NOTE: {c.name} is an interface: implement pure virtuals in Mock{c.name}.")
@@ -1735,14 +1783,21 @@ class TestGen:
     def _instance_map(seq: SeqDiagram) -> dict[str, str]:
         return {lid: ll.instance for lid, ll in seq.lifelines.items()}
 
-    def _selected_branches(self, choices: list[PathChoice]) -> set[int]:
-        return {(c.block_id, c.branch) for c in choices if c.kind != "loop" or c.iteration > 0}
+    def _selected_branches(self, choices: list[PathChoice]) -> set[tuple[str, int]]:
+        """(block_id, branch) pairs whose body executes on this path. A loop with
+        iteration > 0 runs its (only) branch; alt/opt branches are selected directly."""
+        return {(c.block_id, c.branch) for c in choices
+                if c.kind != "loop" or c.iteration > 0}
 
-    def _calls_of_path(self, seq: SeqDiagram, choices: list[PathChoice]):
+    def _calls_of_path(self, seq: SeqDiagram, choices: list[PathChoice],
+                       inst2var: dict[str, str]):
         """[(PathChoice | None, CallRec)] - the owner-sent calls executed on this path,
-        in order, tagged with the path selection they belong to."""
+        in order, tagged with the path selection they belong to. Bound variables used as
+        arguments resolve to their binding call's collaborator instance so matchers can
+        refer to them (they are declared before the EXPECT_CALLs)."""
         sel = self._selected_branches(choices)
-        out = []
+        out: list[tuple[PathChoice | None, CallRec]] = []
+        bind_var: dict[str, str] = {}     # bound var name -> instance of its binding call
 
         def walk(items, cur):
             for it in items:
@@ -1755,18 +1810,22 @@ class TestGen:
                     if it.dashed and not (seq.call_bindings or {}).get(it):
                         continue
                     args = [a.strip() for a in split_top(cm[2] or "") if a.strip()]
-                    out.append((cur, CallRec(it.receiver, cm[1], args,
-                                             (seq.call_bindings or {}).get(it))))
+                    rec = CallRec(inst2var.get(it.receiver, it.receiver), cm[1], args,
+                                  (seq.call_bindings or {}).get(it))
+                    if rec.binding:
+                        bind_var[rec.binding] = rec.instance
+                    out.append((cur, rec))
                 elif isinstance(it, Block):
                     bid = _sanitize(f"{it.kind}{it.line}")
                     for i, br in enumerate(it.branches):
-                        ch = next((c for c in choices if c.block_id == bid and c.branch == i), None)
+                        ch = next((c for c in choices
+                                   if c.block_id == bid and c.branch == i), None)
                         if ch is None or (bid, i) not in sel:
                             continue
                         walk(br.items, ch)
 
         walk(seq.root.items[1:], None)
-        return out
+        return out, bind_var
 
     @staticmethod
     def _iter_rep(ch: PathChoice) -> int:
@@ -1799,17 +1858,79 @@ class TestGen:
         expr = cp.expr or var
         return ty, _guard_value(expr, var, want)
 
-    def _control_for_selection(self, seq: SeqDiagram, ch: PathChoice) -> ControlPoint | None:
-        cps = _cps_for(seq, ch)
+    def _control_for_selection(self, m: Method, ch: PathChoice) -> ControlPoint | None:
+        cps = _cps_for(m.controls, ch)
         if not cps:
             return None
         if ch.kind == "loop":
             return cps[0]
-        return next((c for c in cps if c.branch == ch.branch), cps[0])
+        if ch.kind == "alt" and ch.branch > 0:
+            # prefer the cp recorded for this exact branch (e.g. its "else")
+            exact = [c for c in cps if c.block_id == ch.block_id and c.branch == ch.branch]
+            if exact:
+                return exact[0]
+        return cps[0]
+
+    def _cond_value(self, cp: ControlPoint, var: str, bindings: dict) -> str | None:
+        """The value `var` must have for this control point's branch to be selected."""
+        if cp.kind == "binding":
+            want = cp.branch >= 0
+            ty = cp.type or (bindings.get(var) or (None, None))[0]
+            if ty is None:
+                return None
+            return (_truthy(ty) if want else _falsy(ty))
+        if cp.kind == "expr":
+            want = cp.branch >= 0          # a skipped 'opt' has no control point at all
+            return _guard_value(cp.expr or var, var, want)
+        if cp.kind == "else":
+            return _falsy("bool")
+        return None                         # free / count: nothing to force on the mock
+
+    def _call_actions(self, cp: ControlPoint | None, rec: CallRec, m: Method,
+                      bind_var: dict[str, str], label: str, rep: int,
+                      notes: list[str]) -> list[str]:
+        """The WillOnce/Times tail of one EXPECT_CALL enforcing path selection."""
+        acts: list[str] = []
+        if cp is None:
+            return acts
+        if cp.kind == "count":
+            n = max(1, rep)
+            cm = re.match(r"(\d+)\s+times?", (cp.expr or "").strip(), re.I)
+            if cm:
+                n = int(cm[1])
+            elif re.match(r"for\s+each\b", (cp.expr or "").strip(), re.I):
+                n = max(2, rep)             # range-for over a container: needs elements
+            acts.append(f".Times({n})")
+            return acts
+        if cp.kind == "expr" and rec.binding and cp.vars and rec.binding in cp.vars:
+            src = bind_var.get(rec.binding)
+            if src == rec.instance:         # the binding call also feeds the guard
+                val = self._cond_value(cp, rec.binding, m.bindings)
+                if val is not None:
+                    acts += [f".WillOnce(::testing::Return({val}))"] * max(1, rep)
+        elif cp.kind == "expr" and not rec.binding and cp.vars:
+            # unbound owner->collaborator call whose result IS the guard expression
+            # (e.g. `if (cursor->hasNext())`): force it through this very call
+            val = self._cond_value(cp, cp.expr or "", m.bindings)
+            if val is not None:
+                acts += [f".WillOnce(::testing::Return({val}))"] * max(1, rep)
+        if cp.var == rec.binding and cp.source and tuple(cp.source[:2]) == (rec.instance, rec.method):
+            want = cp.branch >= 0
+            ty = cp.type or m.bindings.get(rec.binding, (None, None))[0]
+            if ty is None:
+                notes.append(f"path '{label}': binding '{rec.binding}' has unknown type; "
+                             "the mock returns a default value")
+                return acts
+            val = _truthy(ty) if want else _falsy(ty)
+            acts += [f".WillOnce(::testing::Return({val}))"] * max(1, rep)
+        return acts
 
     # -- fixtures -----------------------------------------------------------
     def _fixture(self, cname: str, mname: str, sig: str, injected: list[tuple[str, str]],
-                 locals_: list[tuple[str, str]], extra_includes: list[str]) -> list[str]:
+                 locals_: list[tuple[str, str]], extra_includes: list[str]) -> tuple[list[str], str]:
+        """Fixture class: StrictMock members for the collaborators plus a
+        system-under-test constructed through aliasing std::shared_ptrs with null
+        deleters (the mocks stay owned by the fixture)."""
         fname = f"{cname}_{_sanitize(mname)}_Test"
         lines = [f"class {fname} : public ::testing::Test {{", "protected:"]
         for inst, ty in injected:
@@ -1817,13 +1938,12 @@ class TestGen:
             lines.append(f"    ::testing::StrictMock<{mc}> {inst};")
         for ln, ty in locals_:
             lines.append(f"    {ty} {ln}{{}};  // no collaborator member for this lifeline")
-        ctor = f"{cname}(" + ", ".join(f"std::shared_ptr<{t}>" for _, t in injected) + ")"
         sid = f"{cname}.{mname}:ctor {sig}"
         if injected:
             args = ", ".join(f"std::shared_ptr<{t}>(&{i}, [](void*){{}})" for i, t in injected)
-            lines.append(f"    {ctor} sut{{{args}}};")
+            lines.append(f"    {cname} sut{{{args}}};")
         else:
-            lines.append(f"    {ctor} sut;")
+            lines.append(f"    {cname} sut;")
         lines.append("")
         lines.append("    void SetUp() override {")
         self.slots.emit(lines, 8, f"{sid}/setup")
@@ -1837,70 +1957,9 @@ class TestGen:
                    label: str, fname: str, injected: list[tuple[str, str]],
                    locals_: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
         notes: list[str] = []
-        inst_ty = {i: t for i, t in injected}
-        for ln, t in locals_:
-            inst_ty[ln] = t
-        body: list[str] = ["    ::testing::InSequence seq;", ""]
-        by_inst: dict[str, list] = {}
-        for i, t in injected:
-            by_inst.setdefault(i, []).append(t)
-        for ln, t in locals_:
-            by_inst.setdefault(ln, []).append(t)
+        body: list[str] = ["    ::testing::InSequence gmock_seq_;", ""]
 
-        # 1. EXPECT_CALL clauses (order = execution order; repeats folded into Times())
-        clauses: list[str] = []
-        pending: list[str] = []
-        seen_key: dict[tuple, int] = {}
-        bound_count: dict[tuple, int] = {}
-        path_calls = self._calls_of_path(seq, choices)
-        for ch, rec in path_calls:
-            key = (rec.instance, rec.method, tuple(rec.args), rec.binding)
-            rep = self._iter_rep(ch) if ch is not None else 1
-            idx = seen_key.get(key, 0)
-            seen_key[key] = idx + 1
-            matcher_args = ", ".join(_matcher(a, {p.name for p in m.params}) for a in rec.args)
-            clause = f"    EXPECT_CALL({rec.instance}, {rec.method}({matcher_args}))"
-            actions: list[str] = []
-            if rec.binding:
-                ty = None
-                for cc in (ch.cps if ch else []) + ([c_] for c_ in []):
-                    pass
-                cps = m.controls
-                bind_cp = next((x for x in cps if x.var == rec.binding
-                                and x.source and x.source[:2] == (rec.instance, rec.method)), None)
-                if bind_cp is not None:
-                    try:
-                        ty, val = self._value_for_binding(seq, bind_cp, rec.binding, m.bindings)
-                        actions.append(f".WillOnce(::testing::Return({val}))")
-                    except LookupError:
-                        ty = m.bindings.get(rec.binding, (None, None))[0]
-                        if ty:
-                            actions.append(f".WillOnce(::testing::Return({_truthy(ty)}))")
-                        notes.append(f"path '{label}': binding '{rec.binding}' has no drivable "
-                                     "condition; the mock returns a default value")
-                elif ty is None:
-                    ty = m.bindings.get(rec.binding, (None, None))[0]
-                    if ty:
-                        actions.append(f".WillOnce(::testing::Return({_truthy(ty)}))")
-                bound_count[key] = bound_count.get(key, 0) + 1
-            tail = "".join(actions)
-            if idx > 0 and rep == 1 and not actions:
-                head = clauses[-1] if clauses else ""
-                # fold identical consecutive calls into the previous Times(n) clause
-                k = (rec.instance, rec.method, tuple(rec.args))
-                prev_idx = sum(1 for kk, vv in seen_key.items() if kk[:2] == key[:2] and vv > 1)
-                del prev_idx, k, head
-            if rep > 1:
-                clause += f".Times({rep})"
-            clause += tail + ";"
-            clauses.append(clause)
-        body += clauses + [""]
-
-        # 2. user slot for extra expectations / state setup
-        tsid = f"{c.name}.{m.name}:test {label}"
-        self.slots.emit(body, 4, f"{tsid}/expect")
-
-        # 3. argument values
+        # 1. argument values (declared first so EXPECT_CALL matchers can reference them)
         args: list[str] = []
         for p in m.params:
             t = cpp_type(p.type)
@@ -1918,7 +1977,88 @@ class TestGen:
             args.append(p.name)
         body.append("")
 
-        # 4. invoke
+        # 2. path calls (in execution order) and the binding variables they produce
+        path_calls, bind_var = self._calls_of_path(seq, choices, self._instance_map(seq))
+
+        # 3. EXPECT_CALL clauses (order = execution order; loop repeats get Times(n))
+        param_names = {p.name for p in m.params}
+        # every owner->collaborator call that produces a bound variable used by a path
+        # condition must return the value that selects that branch
+        cond_cps = [cp for cp in m.controls if cp.drivable and cp.kind != "free"]
+
+        def forced_value(rec: CallRec) -> str | None:
+            """The value the mock must return so every condition fed by this call's
+            binding selects the branch taken on the current path (None if unrelated)."""
+            val: str | None = None
+
+            def want_for(cp: ControlPoint) -> bool:
+                """Is cp's branch selected on this path? Binding cps of an alt record
+                only branch 0; their block is 'taken' when the path chose any branch."""
+                same = [c for c in choices
+                        if re.sub(r"\d+$", "", c.block_id)
+                        == re.sub(r"\d+$", "", cp.block_id)]
+                if not same:
+                    return cp.branch >= 0          # outer block always runs its first branch
+                ch = same[0]
+                if ch.kind == "loop":
+                    return ch.iteration > 0
+                if cp.kind == "binding" and cp.branch == 0:
+                    return True                     # alt/opt entry condition
+                return ch.branch == cp.branch
+
+            for cp in cond_cps:
+                if cp.var != rec.binding or not cp.source \
+                        or tuple(cp.source[:2]) != (rec.instance, rec.method):
+                    continue
+                if cp.kind == "binding":
+                    ty = cp.type or m.bindings.get(rec.binding, (None, None))[0]
+                    if ty is None:
+                        notes.append(f"path '{label}': binding '{rec.binding}' has unknown "
+                                     "type; the mock returns a default value")
+                        return None
+                    v = _truthy(ty) if want_for(cp) else _falsy(ty)
+                elif cp.kind == "expr" and cp.vars and cp.var in cp.vars:
+                    v = self._guard_value(cp.expr or cp.var, cp.var, want_for(cp))
+                else:
+                    continue
+                if val is not None and v != val:
+                    notes.append(f"path '{label}': binding '{rec.binding}' feeds conflicting "
+                                 "conditions; the first value wins")
+                    continue
+                val = v
+            return val
+
+        clauses: list[str] = []
+        for ch, rec in path_calls:
+            rep = self._iter_rep(ch) if ch is not None else 1
+            matcher_args = ", ".join(
+                _matcher(a, param_names | set(m.bindings)) for a in rec.args)
+            clause = f"    EXPECT_CALL({rec.instance}, {rec.method}({matcher_args}))"
+            cp = self._control_for_selection(m, ch) if ch is not None else None
+            actions = self._call_actions(cp, rec, m, bind_var, label, rep, notes)
+            tail = "".join(actions)
+            if not tail and rec.binding:
+                val = forced_value(rec)      # guard-binding call outside its own block
+                if val is not None:
+                    tail = f".WillOnce(::testing::Return({val}))" * max(1, rep)
+            if not tail and rep > 1:      # untagged call inside an N-times loop body
+                tail = f".Times({rep})"
+            elif cp is not None and cp.kind == "count" and rec.binding \
+                    and len(actions) == 1 and re.fullmatch(r"\.Times\(\d+\)", actions[0]):
+                # a bound call that runs once per iteration: one WillOnce(Return(v)) per
+                # iteration so the loop can actually run its exit-condition path
+                n = int(actions[0][len(".Times("):-1])
+                ty = m.bindings.get(rec.binding, (None, None))[0] or "bool"
+                tail = f".Times({n})" + f".WillOnce(::testing::Return({_truthy(ty)}))" * n
+            clause += tail + ";"
+            clauses.append(clause)
+        body += clauses + [""]
+
+        # 4. user slot for extra expectations / state setup
+        tsid = f"{c.name}.{m.name}:test {label}"
+        self.slots.emit(body, 4, f"{tsid}/expect")
+
+        # 5. invoke
         call = f"sut.{m.name}({', '.join(args)})"
         if m.static:
             call = f"{c.name}::{m.name}({', '.join(args)})"
@@ -1930,7 +2070,7 @@ class TestGen:
             body.append("    (void)result;")
         body.append("")
 
-        # 5. user assertions slot
+        # 6. user assertions slot
         self.slots.emit(body, 4, tsid)
         return body, notes
 
@@ -1939,21 +2079,26 @@ class TestGen:
         seq = m.seq
         if seq is None:
             return None
-        inst2type = self._instance_map(seq)
         collabs = SeqEmitter.collab_lifelines(seq, self.dashed_calls)
-        resolved = SeqEmitter(self.g, c, m, "").resolve_targets(collabs)
-        injected = [(inst2type[lid], resolved[lid][1]) for lid in collabs
-                    if lid in resolved and resolved[lid][1] in inst2type or False]
-        # rebuild ordered (instance, type) pairs for collaborators resolved to members
+        em = SeqEmitter(self.g, c, m, "")
+        access: dict[str, tuple[str, str]] = {}
+        local_map: dict[str, str] = {}
+        em.resolve_into(collabs, access, locals_out=local_map)
+        inst2type = {lid: cpp_type(seq.lifelines[lid].type) for lid in seq.lifelines}
+        # ordered (variable, type) pairs: mocks for injected members, plain objects for locals
         inj_pairs: list[tuple[str, str]] = []
         local_pairs: list[tuple[str, str]] = []
+        seen_vars: set[str] = set()
         for lid in collabs:
-            inst = inst2type.get(lid, decap(seq.lifelines[lid].type))
-            ty = cpp_type(seq.lifelines[lid].type)
-            if lid in resolved and resolved[lid][2] == "local":
-                local_pairs.append((inst, ty))
+            var, _arrow = access[lid]
+            ty = inst2type[lid]
+            if var in seen_vars:
+                continue
+            seen_vars.add(var)
+            if lid in local_map:
+                local_pairs.append((var, ty))
             else:
-                inj_pairs.append((inst, ty))
+                inj_pairs.append((var, ty))
         sig = ",".join(cpp_type(p.type) for p in m.params)
         fname = f"{c.name}_{_sanitize(m.name)}_Test"
         includes = sorted({mock_class_name(t) for _, t in inj_pairs})
@@ -1975,25 +2120,30 @@ class TestGen:
             tb, notes = self._test_body(c, m, seq, chs, label, fname, inj_pairs, local_pairs)
             for n in notes:
                 self.warn(f"--generate-tests: {c.name}::{m.name}: {n}")
-            free_cps = [cp for ch in chs for cp in _cps_for(seq, ch) if cp.kind == "free"]
+            free_cps = [cp for ch in chs for cp in _cps_for(m.controls, ch) if cp.kind == "free"]
             body.append(f"// Path '{label}'"
                         + (f" - NOT fully drivable: {', '.join(sorted(set(comment_text(cp.expr or '') for cp in free_cps)))}"
                            if free_cps else ""))
             if free_cps:
                 body.append("// TODO: assign the free guard(s) in the branch-entry USER CODE slot "
-                            "of Dog.cpp (they stay false otherwise).")
+                            f"of {c.name}.cpp (they stay false otherwise).")
             body.append(f"TEST_F({fname}, {re.sub(r'[^A-Za-z0-9_]', '_', label)}) {{")
             body += tb
             body.append("}")
             body.append("")
         head = BANNER + ['']
-        inc = ['#include "<gtest/gtest.h>"', '#include "<gmock/gmock.h>"',
+        inc = ['#include <gtest/gtest.h>', '#include <gmock/gmock.h>',
                f'#include "{c.name}.hpp"'] + [f'#include "{n}.hpp"' for n in includes]
         inc += [f'#include "{t}.hpp"' for _, t in local_pairs]
         txt = "\n".join(head + inc) + "\n\n" + "\n".join(body).rstrip() + "\n"
         return f"{fname}.cpp", txt
 
     def generate(self) -> dict[str, str]:
+        # Populate m.controls / m.bindings (the path->condition machinery reads them);
+        # class_source() runs the SeqEmitter that records them. Idempotent.
+        for c in self.g.class_order():
+            if not self.g.inline_bodies or not self.g.data_class(c):
+                self.g.class_source(c)
         files: dict[str, str] = {}
         for c in self._collab_classes():
             files[f"{mock_class_name(c.name)}.hpp"] = "\n".join(
@@ -2198,7 +2348,24 @@ def main() -> int:
                          "'friend struct <Class>_TestAccess;'")
     ap.add_argument("--no-maybe-unused", action="store_true",
                     help="do not add [[maybe_unused]] to generated parameters (pre-C++17 targets)")
+    ap.add_argument("--generate-tests", "--tests", dest="generate_tests", action="store_true",
+                    help="also generate Mock<Class>.hpp files and <Class>_<Method>_Test.cpp "
+                         "path tests for every sequence-implemented method (implies --testable)")
+    ap.add_argument("--max-paths", metavar="N", type=int, default=DEFAULT_MAX_PATHS,
+                    help=f"cap the number of generated path tests per method "
+                         f"(default {DEFAULT_MAX_PATHS}); a truncated method gets a warning")
+    ap.add_argument("--test-dir", metavar="DIR",
+                    help="write the generated *_Test.cpp files here (default: tests/ next to "
+                         "-o DIR, or ./tests without -o)")
+    ap.add_argument("--mock-dir", metavar="DIR",
+                    help="write the generated Mock*.hpp files here (default: together with "
+                         "the test files in --test-dir)")
     a = ap.parse_args()
+    if a.generate_tests:
+        a.testable = True          # mocks/injection are only meaningful in testable mode
+    if a.max_paths < 1:
+        print("error: --max-paths must be >= 1", file=sys.stderr)
+        return 1
 
     warn = lambda m: print(f"warning: {m}", file=sys.stderr)
     import os
@@ -2209,32 +2376,55 @@ def main() -> int:
               file=sys.stderr)
         return 1
     to_disk = bool(hdir and cdir)
+    tdir = a.test_dir or (os.path.join(a.out_dir, "tests") if a.out_dir else "tests")
+    mdir = a.mock_dir or tdir
 
     def dest(fn: str) -> str:
+        if fn.startswith("Mock") and fn.endswith(".hpp"):
+            return os.path.join(mdir, fn)
+        if fn.endswith("_Test.cpp"):
+            return os.path.join(tdir, fn)
         return os.path.join(hdir if fn.endswith(".hpp") else cdir, fn)
 
     try:
         classes = build_model(open(a.input, encoding="utf-8").read(), a.external, warn,
                               a.dashed_calls)
         preserved: dict[str, str] = {}
+        test_preserved: dict[str, str] = {}
         if to_disk:
             for fn in file_names(classes, a.external, a.single, a.data_split):
                 path = dest(fn)
                 if os.path.exists(path):
                     preserved.update(harvest(open(path, encoding="utf-8").read()))
+        if a.generate_tests and to_disk:
+            for d in (tdir, mdir):
+                for dirpath, _dirs, fnames in [os.walk(d)] if os.path.isdir(d) else []:
+                    for fn in fnames:
+                        if fn.startswith("Mock") and fn.endswith(".hpp") or fn.endswith("_Test.cpp"):
+                            path = os.path.join(dirpath, fn)
+                            test_preserved.update(harvest(open(path, encoding="utf-8").read()))
         files = generate_files(classes, preserved, a.include, a.external, a.dashed_calls,
                                warn, not a.no_maybe_unused, a.single, a.include_prefix,
                                data_split=a.data_split, testable=a.testable)
+        if a.generate_tests:
+            tg = TestGen(classes, external=a.external, dashed_calls=a.dashed_calls,
+                         maybe_unused=not a.no_maybe_unused, warn=warn,
+                         max_paths=a.max_paths, testable=True, preserved=test_preserved)
+            files.update(tg.generate())
     except DiagramError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if to_disk:
-        for d in {hdir, cdir}:
+        for d in {hdir, cdir} | ({tdir, mdir} if a.generate_tests else set()):
             os.makedirs(d, exist_ok=True)
         for fn, txt in files.items():
-            with open(dest(fn), "w", encoding="utf-8") as f:
+            path = dest(fn)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(txt)
         where = hdir if hdir == cdir else f"{hdir} (.hpp) and {cdir} (.cpp)"
+        if a.generate_tests:
+            where += f", {tdir} (*_Test.cpp) and {mdir} (Mock*.hpp)"
         print(f"wrote {len(files)} files to {where}", file=sys.stderr)
     else:
         for fn, txt in files.items():
