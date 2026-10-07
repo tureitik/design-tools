@@ -115,6 +115,36 @@ USER CODE SLOTS
   every file. When an output file already exists, the code inside each slot is carried over by id.
   Slots whose id disappeared from the diagrams are kept at the end of the class's .cpp as
   commented-out ORPHAN blocks (and restored automatically if the slot comes back).
+  The same harvest()/slot/orphan machinery is applied to every generated test and mock file.
+
+TEST GENERATION (--generate-tests / --tests, implies --testable)
+  Mock headers  Mock<Class>.hpp for every collaborator class (every generated class in
+                --testable mode): 'class Mock<Class> : public <Class>' with one MOCK_METHOD
+                per non-static, non-constructor method. Primitives and pointer/reference
+                types are passed by value, std::shared_ptr/std::unique_ptr by value,
+                other diagram classes by T& (matching the real signature), everything
+                else by const T&.
+  Path tests    <Class>_<Method>_Test.cpp for every class owning sequence-implemented
+                methods. All distinct execution paths through the alt/opt/loop blocks are
+                enumerated (alt: one path per branch; opt: taken + skipped; loop: 0, 1 or
+                N iterations; adjacent blocks give the Cartesian product; nested blocks
+                multiply as well). --max-paths N caps the number of paths per method
+                (default 32); when a method is truncated a warning names it.
+                Each path becomes a TEST_F in a fixture <Class>_<Method>_Test holding
+                ::testing::StrictMock members for the collaborators and constructing the
+                system under test through the injected shared_ptrs (aliasing shared_ptrs
+                with no-op deleters so the mocks live in the fixture). Every test starts
+                with ::testing::InSequence so EXPECT_CALLs enforce the strict call order;
+                bound calls get WillOnce(Return(<value>)) where the path condition selects
+                the return value; arguments become Eq(literal)/Eq(parameter)/_ matchers.
+                Free (natural-language) guards cannot be driven from the mocks: their bool
+                stays false and a warning tells you to assign it in the branch-entry user
+                slot. A USER CODE slot [Class::method(sig)/test <path>] is emitted in each
+                test for state/return-value assertions.
+  Output        files go to --test-dir (default: tests/ next to -o DIR, or ./tests without
+                -o); --mock-dir puts the Mock*.hpp files elsewhere (they are always written
+                into --test-dir too unless --mock-dir is given). Without -o/--test-dir all
+                test/mock files are printed to stdout.
 """
 from __future__ import annotations
 
@@ -1495,6 +1525,489 @@ class SeqEmitter:
             self.g.slots.emit(self.out, lvl * 4, f"{self.sid}/advance {var}", f"{var}++;")
         self.out.append(f"{pad}}}")
         self.slot(lvl, f"after {b.kind}({first})")
+
+
+# --------------------------------------------------------------------------- test generation
+
+DEFAULT_MAX_PATHS = 32
+
+
+def is_literal(a: str) -> bool:
+    """True for simple numeric / boolean literals (everything else is an expression)."""
+    a = a.strip()
+    if a in ("true", "false", "nullptr"):
+        return True
+    return bool(re.fullmatch(r"[+-]?(0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)[uUlL]*", a))
+
+
+def _sanitize(s: str) -> str:
+    return re.sub(r"\W", "_", s)
+
+
+@dataclass
+class PathChoice:
+    """One selected branch of one block along an enumerated execution path."""
+    block_id: str
+    kind: str            # "alt" | "opt" | "loop"
+    branch: int          # index of the chosen Branch (Branch objects compare by identity)
+    iteration: int = 0   # loops only: 0 = skipped, 1 = once, 2 = N times (>= 2 iterations)
+
+
+def _cps_for(controls: list[ControlPoint], sel: PathChoice) -> list[ControlPoint]:
+    """The control points recorded while emitting that belong to one path selection."""
+    cps = controls or []
+    same = [c for c in cps if c.block_id == sel.block_id and c.branch == sel.branch]
+    if sel.kind != "loop":
+        return same
+    out: list[ControlPoint] = []
+    for c in same:
+        if c.kind in ("count", "expr") or (c.kind == "binding" and c.var):
+            out.append(c)     # the loop guard drives every iteration count
+    return out
+
+
+def enumerate_block(b: Block, bid: str) -> list[list[PathChoice]]:
+    """Every distinct way through ONE block, each as the list of selections it makes.
+
+    alt: one path per branch; opt: taken + skipped; loop: 0 iterations, exactly 1
+    iteration and an 'N times' path (>= 2 iterations, i.e. the exit-condition path).
+    Nested blocks multiply: the choices of the inner blocks are appended to every
+    outer choice that contains them.
+    """
+    if b.kind == "alt":
+        return [[PathChoice(bid, "alt", i)] for i in range(len(b.branches))]
+    if b.kind == "opt":
+        return [[PathChoice(bid, "opt", 0)], []]
+    outs: list[list[PathChoice]] = []
+    for it in (1, 2):                       # 1 -> a single iteration, 2 -> the N-times path
+        inner: list[list[PathChoice]] = [[]]
+        for sub in b.branches[0].items:     # the loop has exactly one branch
+            if isinstance(sub, Block):
+                subs = enumerate_block(sub, f"{bid}_{_sanitize(sub.kind)}{sub.line}")
+                if all(not p for p in inner):        # empty body before the first sub-block
+                    inner = [[PathChoice(bid, "loop", 0, it)]]
+                inner = [p + q for p in inner for q in subs]
+            else:
+                inner = [p + [PathChoice(bid, "loop", 0, it)] for p in inner]
+        outs += [[PathChoice(bid, "loop", 0, 0)] + p for p in inner]   # 0 iterations
+        outs += [[PathChoice(bid, "loop", 0, it)] + p for p in inner]  # >= 1 iteration
+    return outs
+
+
+def enumerate_paths(seq: SeqDiagram) -> tuple[list[list[PathChoice]], int]:
+    """All paths through a sequence diagram plus the uncapped combination count."""
+    total = 1
+    combos: list[list[list[PathChoice]]] = []
+    for it in seq.root.items[1:]:           # items[0] is the entry call
+        if not isinstance(it, Block):
+            continue
+        bid = _sanitize(f"{it.kind}{it.line}")
+        opts = enumerate_block(it, bid)
+        total *= max(1, len(opts))
+        combos.append(opts)
+    paths: list[list[PathChoice]] = [[]]
+    for opts in combos:
+        paths = [p + q for p in paths for q in opts]
+    return paths, total
+
+
+def path_label(choices: list[PathChoice], used: set[str]) -> str:
+    parts = [f"{c.block_id}_{_sanitize(str(c.iteration))}" if c.kind == "loop"
+             else f"{c.block_id}_{_sanitize(str(c.branch))}" for c in choices]
+    base = "_".join(parts) if parts else "straight"
+    lab, n = base, 2
+    while lab in used:                      # two identically-labelled blocks must differ
+        lab = f"{base}#{n}"
+        n += 1
+    used.add(lab)
+    return lab
+
+
+def _truthy(ty: str) -> str:
+    t = ty.strip()
+    if t == "bool":
+        return "true"
+    if PRIM_RE.match(t):
+        return "1"
+    if t.endswith("*"):
+        return "reinterpret_cast<%s>(1)" % t
+    if is_pointer_like(t):
+        return f"{t}{{}}"
+    return f"{t}{{}}"
+
+
+def _falsy(ty: str) -> str:
+    t = ty.strip()
+    if t == "bool":
+        return "false"
+    if PRIM_RE.match(t):
+        return "0"
+    if t.endswith("*") or is_pointer_like(t):
+        return "nullptr"
+    return f"{t}{{}}"
+
+
+def _guard_value(expr: str, var: str, want_true: bool) -> str:
+    """A value for `var` that makes the (simple) guard expression evaluate to want_true."""
+    e = expr.strip()
+    m = re.fullmatch(rf"!{re.escape(var)}", e)
+    if m:
+        return _falsy("bool") if want_true else _truthy("bool")
+    m = re.fullmatch(rf"{re.escape(var)}\s*(==|!=)\s*(.+)", e)
+    if m:
+        rhs = m[2].strip()
+        eq = (m[1] == "==") == want_true
+        return rhs if eq else (_falsy("bool") if rhs == "true" else
+                               _truthy("bool") if rhs == "false" else rhs)
+    return _truthy("bool") if want_true else _falsy("bool")
+
+
+def _matcher(arg: str, param_names: set[str]) -> str:
+    a = arg.strip()
+    if is_literal(a):
+        lit = a.rstrip("uUlL") if re.fullmatch(r"[+-]?0[xX]?[0-9a-fA-F]+[uUlL]+", a) else a
+        return f"::testing::Eq({lit})"
+    if re.fullmatch(r"[A-Za-z_]\w*", a) and a in param_names:
+        return f"::testing::Eq({a})"
+    return "::testing::_"
+
+
+def _mock_param(g: "Gen", p: Param) -> str:
+    """MOCK_METHOD parameter type: primitives and pointer/reference types by value,
+    smart pointers by value, other diagram classes by T& (matching the real signature),
+    everything else by const T&."""
+    t = cpp_type(p.type)
+    if PRIM_RE.match(t) or t.endswith(("&", "*")) or is_pointer_like(t):
+        return t
+    if t in g.classes and any(m.name != t and not m.static for m in g.classes[t].methods):
+        return f"{t}&"
+    return f"const {t}&"
+
+
+def mock_class_name(name: str) -> str:
+    return f"Mock{name}"
+
+
+def emit_mock(c: ClassInfo, g: "Gen") -> list[str]:
+    """Mock<Class> : public <Class> with a MOCK_METHOD for every non-static,
+    non-constructor method (the class must have virtual methods - --testable mode)."""
+    lines = [f"#pragma once", "",
+             '#include "<gmock/gmock.h>"',
+             f'#include "{c.name}.hpp"', ""]
+    if c.stereotype == "interface":
+        lines.append(f"// NOTE: {c.name} is an interface: implement pure virtuals in Mock{c.name}.")
+    lines.append(f"class {mock_class_name(c.name)} : public {c.name} {{")
+    lines.append("public:")
+    for m in c.methods:
+        if m.static or m.name == c.name:
+            continue
+        ret = "" if m.abstract and c.stereotype == "interface" else cpp_type(m.ret)
+        params = ", ".join(f"{_mock_param(g, p)} {p.name}" for p in m.params)
+        lines.append(f"    MOCK_METHOD({ret}, {m.name}, ({params}), (override));")
+    lines += ["};", ""]
+    return lines
+
+
+class TestGen:
+    """Generates Mock*.hpp and <Class>_<Method>_Test.cpp files from the model."""
+
+    def __init__(self, classes, external=(), dashed_calls=False, maybe_unused=True,
+                 warn=lambda msg: None, max_paths: int = DEFAULT_MAX_PATHS,
+                 testable: bool = True, preserved: dict[str, str] | None = None):
+        self.classes = classes
+        self.external = set(external)
+        self.dashed_calls = dashed_calls
+        self.max_paths = max(1, int(max_paths))
+        self.warn = warn
+        self.slots = Slots(preserved or {})
+        self.g = Gen(classes, self.slots, external, dashed_calls, maybe_unused, warn,
+                     inline_bodies=False, testable=testable)
+
+    # -- helpers ------------------------------------------------------------
+    def _collab_classes(self) -> list[ClassInfo]:
+        """Collaborators of the sequences (every generated class in --testable mode)."""
+        names = set(self.g.collab_names)
+        if self.g.testable:
+            names |= set(self.g.gen)
+        return [self.classes[n] for n in sorted(names) if n in self.g.genset]
+
+    @staticmethod
+    def _instance_map(seq: SeqDiagram) -> dict[str, str]:
+        return {lid: ll.instance for lid, ll in seq.lifelines.items()}
+
+    def _selected_branches(self, choices: list[PathChoice]) -> set[int]:
+        return {(c.block_id, c.branch) for c in choices if c.kind != "loop" or c.iteration > 0}
+
+    def _calls_of_path(self, seq: SeqDiagram, choices: list[PathChoice]):
+        """[(PathChoice | None, CallRec)] - the owner-sent calls executed on this path,
+        in order, tagged with the path selection they belong to."""
+        sel = self._selected_branches(choices)
+        out = []
+
+        def walk(items, cur):
+            for it in items:
+                if isinstance(it, Call):
+                    if it.sender != seq.owner:
+                        continue
+                    cm = CALL_RE.match(it.text)
+                    if not cm:
+                        continue
+                    if it.dashed and not (seq.call_bindings or {}).get(it):
+                        continue
+                    args = [a.strip() for a in split_top(cm[2] or "") if a.strip()]
+                    out.append((cur, CallRec(it.receiver, cm[1], args,
+                                             (seq.call_bindings or {}).get(it))))
+                elif isinstance(it, Block):
+                    bid = _sanitize(f"{it.kind}{it.line}")
+                    for i, br in enumerate(it.branches):
+                        ch = next((c for c in choices if c.block_id == bid and c.branch == i), None)
+                        if ch is None or (bid, i) not in sel:
+                            continue
+                        walk(br.items, ch)
+
+        walk(seq.root.items[1:], None)
+        return out
+
+    @staticmethod
+    def _iter_rep(ch: PathChoice) -> int:
+        return 1 if ch.iteration <= 1 else 2      # "N times" paths get two repetitions
+
+    def _return_of(self, seq: SeqDiagram, call: Call, bindings: dict) -> str | None:
+        """C++ type of the variable a call result is bound to (None when unbound)."""
+        name = (seq.call_bindings or {}).get(call)
+        if name is None:
+            return None
+        ty = (seq.call_bind_types or {}).get(call)
+        if ty is None and name in bindings:
+            ty = bindings[name][0]
+        return ty
+
+    def _value_for_binding(self, seq: SeqDiagram, cp: ControlPoint, var: str,
+                           bindings: dict) -> tuple[str, str]:
+        """(type, literal) the mocks must return so the path condition selects `cp`."""
+        src = cp.source or (bindings.get(var) or (None, None))[1]
+        ty = cp.type or bindings.get(var, (None, None))[0]
+        if src is None or ty is None:
+            raise LookupError(cp)
+        want = cp.kind != "else"
+        if cp.kind == "else":
+            want = False
+        if cp.kind == "binding":
+            val = "true" if want else "false" if ty.strip() == "bool" else \
+                (_truthy(ty) if want else _falsy(ty))
+            return ty, val
+        expr = cp.expr or var
+        return ty, _guard_value(expr, var, want)
+
+    def _control_for_selection(self, seq: SeqDiagram, ch: PathChoice) -> ControlPoint | None:
+        cps = _cps_for(seq, ch)
+        if not cps:
+            return None
+        if ch.kind == "loop":
+            return cps[0]
+        return next((c for c in cps if c.branch == ch.branch), cps[0])
+
+    # -- fixtures -----------------------------------------------------------
+    def _fixture(self, cname: str, mname: str, sig: str, injected: list[tuple[str, str]],
+                 locals_: list[tuple[str, str]], extra_includes: list[str]) -> list[str]:
+        fname = f"{cname}_{_sanitize(mname)}_Test"
+        lines = [f"class {fname} : public ::testing::Test {{", "protected:"]
+        for inst, ty in injected:
+            mc = mock_class_name(ty)
+            lines.append(f"    ::testing::StrictMock<{mc}> {inst};")
+        for ln, ty in locals_:
+            lines.append(f"    {ty} {ln}{{}};  // no collaborator member for this lifeline")
+        ctor = f"{cname}(" + ", ".join(f"std::shared_ptr<{t}>" for _, t in injected) + ")"
+        sid = f"{cname}.{mname}:ctor {sig}"
+        if injected:
+            args = ", ".join(f"std::shared_ptr<{t}>(&{i}, [](void*){{}})" for i, t in injected)
+            lines.append(f"    {ctor} sut{{{args}}};")
+        else:
+            lines.append(f"    {ctor} sut;")
+        lines.append("")
+        lines.append("    void SetUp() override {")
+        self.slots.emit(lines, 8, f"{sid}/setup")
+        lines.append("    }")
+        lines.append("};")
+        lines.append("")
+        return lines, fname
+
+    # -- one TEST_F ---------------------------------------------------------
+    def _test_body(self, c: ClassInfo, m: Method, seq: SeqDiagram, choices: list[PathChoice],
+                   label: str, fname: str, injected: list[tuple[str, str]],
+                   locals_: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+        notes: list[str] = []
+        inst_ty = {i: t for i, t in injected}
+        for ln, t in locals_:
+            inst_ty[ln] = t
+        body: list[str] = ["    ::testing::InSequence seq;", ""]
+        by_inst: dict[str, list] = {}
+        for i, t in injected:
+            by_inst.setdefault(i, []).append(t)
+        for ln, t in locals_:
+            by_inst.setdefault(ln, []).append(t)
+
+        # 1. EXPECT_CALL clauses (order = execution order; repeats folded into Times())
+        clauses: list[str] = []
+        pending: list[str] = []
+        seen_key: dict[tuple, int] = {}
+        bound_count: dict[tuple, int] = {}
+        path_calls = self._calls_of_path(seq, choices)
+        for ch, rec in path_calls:
+            key = (rec.instance, rec.method, tuple(rec.args), rec.binding)
+            rep = self._iter_rep(ch) if ch is not None else 1
+            idx = seen_key.get(key, 0)
+            seen_key[key] = idx + 1
+            matcher_args = ", ".join(_matcher(a, {p.name for p in m.params}) for a in rec.args)
+            clause = f"    EXPECT_CALL({rec.instance}, {rec.method}({matcher_args}))"
+            actions: list[str] = []
+            if rec.binding:
+                ty = None
+                for cc in (ch.cps if ch else []) + ([c_] for c_ in []):
+                    pass
+                cps = m.controls
+                bind_cp = next((x for x in cps if x.var == rec.binding
+                                and x.source and x.source[:2] == (rec.instance, rec.method)), None)
+                if bind_cp is not None:
+                    try:
+                        ty, val = self._value_for_binding(seq, bind_cp, rec.binding, m.bindings)
+                        actions.append(f".WillOnce(::testing::Return({val}))")
+                    except LookupError:
+                        ty = m.bindings.get(rec.binding, (None, None))[0]
+                        if ty:
+                            actions.append(f".WillOnce(::testing::Return({_truthy(ty)}))")
+                        notes.append(f"path '{label}': binding '{rec.binding}' has no drivable "
+                                     "condition; the mock returns a default value")
+                elif ty is None:
+                    ty = m.bindings.get(rec.binding, (None, None))[0]
+                    if ty:
+                        actions.append(f".WillOnce(::testing::Return({_truthy(ty)}))")
+                bound_count[key] = bound_count.get(key, 0) + 1
+            tail = "".join(actions)
+            if idx > 0 and rep == 1 and not actions:
+                head = clauses[-1] if clauses else ""
+                # fold identical consecutive calls into the previous Times(n) clause
+                k = (rec.instance, rec.method, tuple(rec.args))
+                prev_idx = sum(1 for kk, vv in seen_key.items() if kk[:2] == key[:2] and vv > 1)
+                del prev_idx, k, head
+            if rep > 1:
+                clause += f".Times({rep})"
+            clause += tail + ";"
+            clauses.append(clause)
+        body += clauses + [""]
+
+        # 2. user slot for extra expectations / state setup
+        tsid = f"{c.name}.{m.name}:test {label}"
+        self.slots.emit(body, 4, f"{tsid}/expect")
+
+        # 3. argument values
+        args: list[str] = []
+        for p in m.params:
+            t = cpp_type(p.type)
+            init = "{}"
+            if PRIM_RE.match(t) and not t.startswith("void"):
+                init = "= 3" if t in ("int", "long", "short", "char", "size_t") or \
+                    re.match(r"u?int\d+_t$", t) or t.startswith("unsigned") else "= 1"
+                if t == "bool":
+                    init = "= true"
+                if t in ("float", "double"):
+                    init = "= 1.0"
+            attr = "[[maybe_unused]] " if self.g.attr else ""
+            body.append(f"    {attr}{t} {p.name} {init};" if init.startswith("=")
+                        else f"    {attr}{t} {p.name}{init};")
+            args.append(p.name)
+        body.append("")
+
+        # 4. invoke
+        call = f"sut.{m.name}({', '.join(args)})"
+        if m.static:
+            call = f"{c.name}::{m.name}({', '.join(args)})"
+        ret = cpp_type(m.ret)
+        if ret == "void" or m.name == c.name:
+            body.append(f"    {call};")
+        else:
+            body.append(f"    auto result = {call};")
+            body.append("    (void)result;")
+        body.append("")
+
+        # 5. user assertions slot
+        self.slots.emit(body, 4, tsid)
+        return body, notes
+
+    # -- whole test file ----------------------------------------------------
+    def generate_test_file(self, c: ClassInfo, m: Method) -> tuple[str, str] | None:
+        seq = m.seq
+        if seq is None:
+            return None
+        inst2type = self._instance_map(seq)
+        collabs = SeqEmitter.collab_lifelines(seq, self.dashed_calls)
+        resolved = SeqEmitter(self.g, c, m, "").resolve_targets(collabs)
+        injected = [(inst2type[lid], resolved[lid][1]) for lid in collabs
+                    if lid in resolved and resolved[lid][1] in inst2type or False]
+        # rebuild ordered (instance, type) pairs for collaborators resolved to members
+        inj_pairs: list[tuple[str, str]] = []
+        local_pairs: list[tuple[str, str]] = []
+        for lid in collabs:
+            inst = inst2type.get(lid, decap(seq.lifelines[lid].type))
+            ty = cpp_type(seq.lifelines[lid].type)
+            if lid in resolved and resolved[lid][2] == "local":
+                local_pairs.append((inst, ty))
+            else:
+                inj_pairs.append((inst, ty))
+        sig = ",".join(cpp_type(p.type) for p in m.params)
+        fname = f"{c.name}_{_sanitize(m.name)}_Test"
+        includes = sorted({mock_class_name(t) for _, t in inj_pairs})
+
+        paths, total = enumerate_paths(seq)
+        truncated = len(paths) > self.max_paths
+        if truncated:
+            paths = paths[:self.max_paths]
+            self.warn(f"--generate-tests: {c.name}::{m.name}({sig}) has {total} path "
+                      f"combinations; only the first {self.max_paths} were generated "
+                      f"(--max-paths)")
+        used: set[str] = set()
+        body: list[str] = [f"// Sequence paths of {c.name}::{m.name}({sig}): {len(paths)} generated"
+                           f"{' (capped by --max-paths)' if truncated else ''} of {total}", ""]
+        fx_lines, fname = self._fixture(c.name, m.name, sig, inj_pairs, local_pairs, includes)
+        body += fx_lines
+        for chs in paths:
+            label = path_label(chs, used)
+            tb, notes = self._test_body(c, m, seq, chs, label, fname, inj_pairs, local_pairs)
+            for n in notes:
+                self.warn(f"--generate-tests: {c.name}::{m.name}: {n}")
+            free_cps = [cp for ch in chs for cp in _cps_for(seq, ch) if cp.kind == "free"]
+            body.append(f"// Path '{label}'"
+                        + (f" - NOT fully drivable: {', '.join(sorted(set(comment_text(cp.expr or '') for cp in free_cps)))}"
+                           if free_cps else ""))
+            if free_cps:
+                body.append("// TODO: assign the free guard(s) in the branch-entry USER CODE slot "
+                            "of Dog.cpp (they stay false otherwise).")
+            body.append(f"TEST_F({fname}, {re.sub(r'[^A-Za-z0-9_]', '_', label)}) {{")
+            body += tb
+            body.append("}")
+            body.append("")
+        head = BANNER + ['']
+        inc = ['#include "<gtest/gtest.h>"', '#include "<gmock/gmock.h>"',
+               f'#include "{c.name}.hpp"'] + [f'#include "{n}.hpp"' for n in includes]
+        inc += [f'#include "{t}.hpp"' for _, t in local_pairs]
+        txt = "\n".join(head + inc) + "\n\n" + "\n".join(body).rstrip() + "\n"
+        return f"{fname}.cpp", txt
+
+    def generate(self) -> dict[str, str]:
+        files: dict[str, str] = {}
+        for c in self._collab_classes():
+            files[f"{mock_class_name(c.name)}.hpp"] = "\n".join(
+                BANNER + [""] + emit_mock(c, self.g)) + "\n"
+        owners: dict[str, ClassInfo] = {}
+        for c in self.classes.values():
+            if c.name in self.external:
+                continue
+            for mm in c.methods:
+                if mm.seq is not None:
+                    out = self.generate_test_file(c, mm)
+                    if out:
+                        files[out[0]] = out[1]
+        return files
 
 
 # --------------------------------------------------------------------------- driver
