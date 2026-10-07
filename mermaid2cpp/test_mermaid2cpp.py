@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Regression tests for mermaid2cpp.py (run: python3 test_mermaid2cpp.py -v).
+"""Regression tests for mermaid2cpp.py (run: pytest test_mermaid2cpp.py -v, or
+python3 test_mermaid2cpp.py -v via the unittest fallback at the bottom of this file).
 
 Every test generates C++ from a small diagram. Where it matters the output is also compiled
 with `g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only` (skipped if g++ is not installed).
+
+The TestGeneration* classes cover the --generate-tests feature end to end: CLI flags and
+output-directory routing, Mock emitter syntax, path enumeration/combinatorics with capping,
+gmock semantics of the generated TEST_F bodies, USER CODE slot preservation across
+regeneration runs, and a full g++ -std=c++17 compilation check of the generated mocks and
+test suites against googletest/googlemock headers (skipped when no gtest headers exist).
 """
+import argparse
 import os
 import re
 import shutil
@@ -11,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
