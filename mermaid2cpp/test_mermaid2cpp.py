@@ -746,5 +746,209 @@ class SlotsAndCli(Base):
             self.assertIn("error:", r.stderr)
 
 
+# --------------------------------------------------------------------------- test generation fixes
+
+class SelfCallSkip(Base):
+    """Self-calls (D->>D) are real method calls, not mockable. _calls_of_path must skip them."""
+
+    SPEC = """
+classDiagram
+  class Dog {
+    -leash: int
+    +walk(times: int) bool
+    +bark()
+  }
+
+sequenceDiagram
+  participant w as Walker
+  participant d as Dog
+  w->>d: walk(times: int) bool
+  d->>d: bark()
+  alt times > 3
+    d->>d: bark()
+  end
+"""
+
+    def _gen_test(self, text):
+        classes = m.build_model(text, [], lambda x: None)
+        tg = m.TestGen(classes, external=[], dashed_calls=False, maybe_unused=True,
+                       warn=lambda x: None, max_paths=32, testable=True)
+        for c in tg.g.class_order():
+            if not tg.g.inline_bodies or not tg.g.data_class(c):
+                tg.g.class_source(c)
+        c = classes["Dog"]
+        mm = [x for x in c.methods if x.name == "walk"][0]
+        return tg.generate_test_file(c, mm)
+
+    def test_no_expect_call_for_self_calls(self):
+        _, txt = self._gen_test(self.SPEC)
+        self.assertNotIn("EXPECT_CALL", txt)
+
+    def test_sut_is_pointer_when_no_collaborators(self):
+        _, txt = self._gen_test(self.SPEC)
+        self.assertIn("Dog *sut = nullptr;", txt)
+        self.assertIn("sut->walk(times)", txt)
+
+    def test_self_call_still_emitted_in_production_code(self):
+        classes, f, _ = build(self.SPEC, testable=True)
+        cpp = code(f["Dog.cpp"])
+        self.assertIn("bark();", cpp)
+
+    def test_self_call_with_collaborator_still_generates_expect_for_collab(self):
+        # Dog calls both itself (bark) and a collaborator (leash.pull)
+        # Only the collaborator call should get an EXPECT_CALL
+        txt = """
+classDiagram
+  class Leash {
+    +pull(force: int)
+  }
+  class Dog {
+    -leash: Leash
+    +walk(times: int) bool
+    +bark()
+  }
+
+sequenceDiagram
+  participant w as Walker
+  participant d as Dog
+  participant leash as Leash
+  w->>d: walk(times: int) bool
+  d->>d: bark()
+  d->>leash: pull(times)
+"""
+        classes = m.build_model(txt, [], lambda x: None)
+        tg = m.TestGen(classes, external=[], dashed_calls=False, maybe_unused=True,
+                       warn=lambda x: None, max_paths=32, testable=True)
+        for c in tg.g.class_order():
+            if not tg.g.inline_bodies or not tg.g.data_class(c):
+                tg.g.class_source(c)
+        c = classes["Dog"]
+        mm = [x for x in c.methods if x.name == "walk"][0]
+        _, t = tg.generate_test_file(c, mm)
+        self.assertIn("EXPECT_CALL(leash, pull", t)
+        self.assertNotIn("EXPECT_CALL(d,", t)
+        self.assertNotIn("EXPECT_CALL(d, bark", t)
+
+
+class PointerSut(Base):
+    """When a class has no collaborator lifelines, the fixture uses a pointer sut
+    so classes without a default constructor can still compile."""
+
+    SPEC = """
+classDiagram
+  class Dog {
+    +walk(times: int) bool
+  }
+
+sequenceDiagram
+  participant w as Walker
+  participant d as Dog
+  w->>d: walk(times: int) bool
+"""
+
+    def _gen_test(self, text):
+        classes = m.build_model(text, [], lambda x: None)
+        tg = m.TestGen(classes, external=[], dashed_calls=False, maybe_unused=True,
+                       warn=lambda x: None, max_paths=32, testable=True)
+        for c in tg.g.class_order():
+            if not tg.g.inline_bodies or not tg.g.data_class(c):
+                tg.g.class_source(c)
+        c = classes["Dog"]
+        mm = [x for x in c.methods if x.name == "walk"][0]
+        return tg.generate_test_file(c, mm)
+
+    def test_no_collaborators_uses_pointer_sut(self):
+        _, txt = self._gen_test(self.SPEC)
+        self.assertIn("Dog *sut = nullptr;", txt)
+        self.assertIn("sut->walk(times)", txt)
+
+    def test_with_collaborators_uses_value_sut(self):
+        txt = """
+classDiagram
+  class Leash {
+    +pull(force: int)
+  }
+  class Dog {
+    -leash: Leash
+    +walk(times: int)
+  }
+
+sequenceDiagram
+  participant w as Walker
+  participant d as Dog
+  participant leash as Leash
+  w->>d: walk(times: int)
+  d->>leash: pull(times)
+"""
+        classes = m.build_model(txt, [], lambda x: None)
+        tg = m.TestGen(classes, external=[], dashed_calls=False, maybe_unused=True,
+                       warn=lambda x: None, max_paths=32, testable=True)
+        for c in tg.g.class_order():
+            if not tg.g.inline_bodies or not tg.g.data_class(c):
+                tg.g.class_source(c)
+        c = classes["Dog"]
+        mm = [x for x in c.methods if x.name == "walk"][0]
+        _, t = tg.generate_test_file(c, mm)
+        self.assertNotIn("*sut", t)
+        self.assertIn("Dog sut{", t)
+        self.assertIn("sut.walk(times)", t)
+
+
+class MockCollaboratorOnly(Base):
+    """_collab_classes generates Mock*.hpp only for collaborator classes,
+    not for every generated class."""
+
+    SPEC = """
+classDiagram
+  class Leash {
+    +pull(force: int)
+  }
+  class Dog {
+    -leash: Leash
+    +walk(times: int)
+  }
+
+sequenceDiagram
+  participant w as Walker
+  participant d as Dog
+  participant leash as Leash
+  w->>d: walk(times: int)
+  d->>leash: pull(times)
+"""
+
+    def _gen(self, text):
+        classes = m.build_model(text, [], lambda x: None)
+        tg = m.TestGen(classes, external=[], dashed_calls=False, maybe_unused=True,
+                       warn=lambda x: None, max_paths=32, testable=True)
+        for c in tg.g.class_order():
+            if not tg.g.inline_bodies or not tg.g.data_class(c):
+                tg.g.class_source(c)
+        return tg.generate()
+
+    def test_mock_generated_for_collaborator(self):
+        files = self._gen(self.SPEC)
+        self.assertIn("MockLeash.hpp", files)
+
+    def test_mock_not_generated_for_non_collaborator(self):
+        files = self._gen(self.SPEC)
+        self.assertNotIn("MockDog.hpp", files)
+
+    def test_no_mock_when_no_collaborators(self):
+        txt = """
+classDiagram
+  class Dog {
+    +walk(times: int)
+  }
+
+sequenceDiagram
+  participant w as Walker
+  participant d as Dog
+  w->>d: walk(times: int)
+"""
+        files = self._gen(txt)
+        mocks = [f for f in files if f.startswith("Mock")]
+        self.assertEqual(mocks, [])
+
+
 if __name__ == "__main__":
     unittest.main()
