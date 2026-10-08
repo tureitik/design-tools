@@ -1773,10 +1773,8 @@ class TestGen:
 
     # -- helpers ------------------------------------------------------------
     def _collab_classes(self) -> list[ClassInfo]:
-        """Collaborators of the sequences (every generated class in --testable mode)."""
+        """Collaborator classes that receive owner-sent calls in at least one sequence."""
         names = set(self.g.collab_names)
-        if self.g.testable:
-            names |= set(self.g.gen)
         return [self.classes[n] for n in sorted(names) if n in self.g.genset]
 
     @staticmethod
@@ -1804,6 +1802,8 @@ class TestGen:
                 if isinstance(it, Call):
                     if it.sender != seq.owner:
                         continue
+                    if it.receiver == seq.owner:
+                        continue      # self-calls are real method calls, not mockable
                     cm = CALL_RE.match(it.text)
                     if not cm:
                         continue
@@ -1943,7 +1943,7 @@ class TestGen:
             args = ", ".join(f"std::shared_ptr<{t}>(&{i}, [](void*){{}})" for i, t in injected)
             lines.append(f"    {cname} sut{{{args}}};")
         else:
-            lines.append(f"    {cname} sut;")
+            lines.append(f"    {cname} *sut = nullptr;")
         lines.append("")
         lines.append("    void SetUp() override {")
         self.slots.emit(lines, 8, f"{sid}/setup")
@@ -2059,7 +2059,8 @@ class TestGen:
         self.slots.emit(body, 4, f"{tsid}/expect")
 
         # 5. invoke
-        call = f"sut.{m.name}({', '.join(args)})"
+        access = "->" if not injected else "."
+        call = f"sut{access}{m.name}({', '.join(args)})"
         if m.static:
             call = f"{c.name}::{m.name}({', '.join(args)})"
         ret = cpp_type(m.ret)
